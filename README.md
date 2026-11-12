@@ -1,263 +1,240 @@
-# AskDocs 📄🔍
+# AskDocs
 
-> **Upload PDFs or text files. Ask questions in plain English. Get cited answers — instantly.**
+**Ask questions about your documents and get answers with the source passages cited.**
 
-A production-style **RAG (Retrieval-Augmented Generation)** service built with FastAPI, FAISS, Gemini, PostgreSQL, and Redis. Answers come with source passages so you can verify every claim.
+AskDocs is an async RAG (retrieval-augmented generation) service. Upload a PDF and it extracts the text, splits it into chunks, embeds them and indexes them in FAISS. When you ask a question, it retrieves the most relevant passages and sends them to an LLM that answers only from that context. If the document doesn't contain the answer, the service says so instead of guessing.
+
+![Demo](docs/demo.gif)
+<!-- TODO: record a 20-30 second GIF of upload -> ask -> cited answer and save it as docs/demo.gif -->
+
+**Stack:** Python · FastAPI · FAISS · PostgreSQL · Redis · Docker · pytest
+
+---
+
+## Features
+
+- **Async API.** FastAPI endpoints with `async`/`await`, an async DB driver and non-blocking LLM calls.
+- **Background ingestion.** Large uploads return immediately with a document id; processing status can be polled.
+- **RAG pipeline.** Configurable chunking, batched embeddings, FAISS vector search and a grounded prompt that returns cited sources.
+- **PostgreSQL storage.** Documents, chunks and query logs in a relational schema with indexes.
+- **Redis caching.** Repeated questions are answered from cache, with an in-memory fallback if Redis is unavailable.
+- **Observability.** Structured JSON logs with a request id and per-stage timings (embed, retrieve, generate).
+- **Tested.** pytest suite with the LLM mocked, so tests run without an API key.
+- **One-command setup.** `docker compose up` starts the API, Postgres and Redis.
+
+> Only keep the lines above that are implemented in your repo. Delete the rest until they are built.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│               Client (Browser / Swagger UI / curl)              │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │  HTTP
-┌──────────────────────────▼──────────────────────────────────────┐
-│                    FastAPI (async, uvicorn)                      │
-│        Middleware: request-id, CORS, structured JSON logs        │
-└──────┬───────────────────────────────────────┬──────────────────┘
-       │                                       │
-┌──────▼──────────────────┐    ┌──────────────▼──────────────────┐
-│   Ingestion Pipeline    │    │        Query Pipeline            │
-│                         │    │                                  │
-│  1. Validate file        │    │  1. Redis answer cache check     │
-│  2. Persist doc to PG   │    │  2. Embed question (Gemini)      │
-│  3. Extract text        │    │  3. FAISS top-k similarity search│
-│     (fitz / plain text) │    │  4. Load chunks from Postgres    │
-│  4. Chunk (500 tok,     │    │  5. Gemini LLM → cited answer    │
-│     50 overlap)         │    │  6. Cache result in Redis        │
-│  5. Embed chunks batch  │    │  7. Log query to Postgres        │
-│  6. Write to FAISS      │    │                                  │
-│  7. Mark doc ready      │    └──────────────┬───────────────────┘
-└──────┬──────────────────┘                   │
-       │                         ┌────────────▼────────────┐
-       │                         │  Redis                  │
-       │                         │  • Answer cache (1 h)   │
-       │                         │  • Embedding cache (24h)│
-       │                         │  • In-memory LRU fallback│
-       │                         └─────────────────────────┘
-       │
-┌──────▼──────────────────┐    ┌─────────────────────────────────┐
-│  PostgreSQL             │    │  FAISS (IndexFlatIP)             │
-│  • documents            │    │  • Cosine similarity (L2-normed) │
-│  • chunks               │    │  • Persisted to disk             │
-│  • queries (logs)       │    │  • Rebuilt on doc delete         │
-│  • Indexes on doc_id,   │    │  • chunk_id ↔ Postgres UUID sync │
-│    created_at           │    └─────────────────────────────────┘
-└─────────────────────────┘
+Client (Swagger UI / simple web page)
+              |
+        FastAPI (async)
+              |
+   +----------+-----------------------+
+   |                                  |
+Ingestion pipeline               Query pipeline
+extract -> chunk -> embed        cache check -> embed question
+   |                             -> retrieve top-k -> LLM -> cite sources
+   |                                  |
+   +--> PostgreSQL (documents,        +--> Redis (answer + embedding cache)
+   |    chunks, query logs)           +--> LLM API
+   +--> FAISS (vector index)
 ```
+
+<!-- TODO: replace with a drawn diagram at docs/architecture.png -->
+
+### Request flow for `/ask`
+
+1. Hash the question plus document ids and check Redis. A hit returns immediately.
+2. Embed the question.
+3. Search FAISS for the top-k chunks.
+4. Load the chunk text from PostgreSQL.
+5. Build a prompt that tells the model to answer only from the provided context, cite chunk ids and say "I don't know" when the context lacks the answer.
+6. Call the LLM, store the answer in Redis and log the query in PostgreSQL.
 
 ---
 
-## Quick Start
+## Quick start
 
-### Option A — Docker Compose (recommended)
+### Requirements
+- Docker and Docker Compose
+- An API key for your LLM provider (Gemini or OpenAI)
+
+### Run
 
 ```bash
-git clone https://github.com/yourname/askdocs
-cd askdocs
-cp .env.example .env
-# Add your GEMINI_API_KEY to .env
-
+git clone https://github.com/<your-username>/askdocs-rag.git
+cd askdocs-rag
+cp .env.example .env        # add your API key
 docker compose up --build
-# API: http://localhost:8000
-# Interactive docs: http://localhost:8000/docs
 ```
 
-### Option B — Local development
+Open **http://localhost:8000/docs** for the interactive API docs.
+
+### Try it
 
 ```bash
-# Prerequisites: Python 3.11+, PostgreSQL 16, Redis 7
-cd askdocs
-python -m venv .venv && .venv\Scripts\activate   # Windows
-pip install -r requirements.txt
+# Upload a document
+curl -F "file=@sample.pdf" http://localhost:8000/documents
 
-cp .env.example .env   # fill in GEMINI_API_KEY and DB credentials
-
-uvicorn app.main:app --reload
-```
-
----
-
-## API Reference
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/documents` | Upload a PDF or text file. Returns `document_id`. Ingestion runs in the background. |
-| `GET` | `/documents` | List all uploaded documents with status and chunk count. |
-| `DELETE` | `/documents/{id}` | Delete a document, its chunks, vectors, and cached answers. |
-| `POST` | `/ask` | Ask a question. Body: `{question, document_ids?, top_k?}`. Returns `{answer, sources[], cached, latency_ms}`. |
-| `GET` | `/health` | Check Postgres, Redis, and FAISS status. |
-
-### Example: upload and ask
-
-```bash
-# 1. Upload
-curl -X POST http://localhost:8000/documents \
-  -F "file=@my_paper.pdf"
-# → {"document_id": "abc-123", "status": "processing"}
-
-# 2. Poll until ready
-curl http://localhost:8000/documents
-# → [{..."status": "ready", "num_chunks": 42}]
-
-# 3. Ask
+# Ask a question
 curl -X POST http://localhost:8000/ask \
   -H "Content-Type: application/json" \
-  -d '{"question": "What methodology did the authors use?", "document_ids": ["abc-123"]}'
+  -d '{"question": "What is the main conclusion?", "top_k": 4}'
+```
+
+Example response:
+
+```json
+{
+  "answer": "...",
+  "sources": [
+    {"chunk_id": 12, "document": "sample.pdf", "text": "..."}
+  ],
+  "cached": false,
+  "latency_ms": 0
+}
 ```
 
 ---
 
-## Design Decisions
+## API
 
-| Decision | Choice | Reason |
-|----------|--------|--------|
-| **Chunk size** | 500 tokens | Fits in one embedding call without truncation; provides enough context for a coherent answer. Too small → loss of context. Too large → retrieves irrelevant text. |
-| **Chunk overlap** | 50 tokens | Prevents facts that straddle a boundary from disappearing. 10% of chunk size is a standard starting point. |
-| **Vector index** | FAISS `IndexFlatIP` | No server to manage, persists to a single file, exact search (no approximation errors at our scale). Switch to `IndexIVFFlat` at >1M vectors. |
-| **Embeddings** | Gemini `text-embedding-004` (768-dim) | Strong multilingual quality, generous free tier, same provider as LLM. |
-| **Cache TTL** | Answers: 1 h, Embeddings: 24 h | Answers change if documents change; embeddings are deterministic so longer TTL is safe. |
-| **LLM temperature** | 0.1 | Lower temperature reduces hallucination in factual Q&A tasks. |
-| **Ingestion** | Background task | Returns HTTP 202 immediately so large PDFs don't time out the client. |
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/documents` | Upload a PDF or text file; returns a document id |
+| GET | `/documents` | List uploaded documents and their processing status |
+| DELETE | `/documents/{id}` | Delete a document, its chunks and its vectors |
+| POST | `/ask` | Ask a question; returns an answer with cited sources |
+| GET | `/health` | Checks PostgreSQL, Redis and the vector index |
 
 ---
 
-## asyncio vs threading vs multiprocessing
+## Configuration
 
-> **Which tool for which problem, and why.**
+Set these in `.env`:
 
-| Tool | Used for | Why |
-|------|----------|-----|
-| **asyncio** | HTTP handling, Postgres (asyncpg), Redis, Gemini API calls | I/O-bound: the CPU is idle while waiting for network. One event loop serves thousands of concurrent requests with no thread overhead. |
-| **threading (`run_in_executor`)** | PDF parsing (PyMuPDF/fitz), synchronous Gemini SDK calls | These are blocking C-library calls that can't be awaited. Wrapping them in `ThreadPoolExecutor` releases the event loop while they run. The GIL is released during I/O within threads. |
-| **multiprocessing (`ProcessPoolExecutor`)** | CPU-heavy PDF extraction of many large files simultaneously | PDF text extraction is CPU-bound (C extension, but GIL-holding). Multiple processes bypass the GIL entirely and run on separate cores. Benchmarked at ~1.8× speedup for 4 large PDFs vs. single process (see below). |
-
----
-
-## Benchmark Results
-
-Run with `python scripts/benchmark.py --n 50 --concurrency 10`:
-
-| Scenario | p50 | p95 |
-|----------|-----|-----|
-| Cold (no cache) | ~1 400 ms | ~2 100 ms |
-| Warm (Redis cache hit) | ~12 ms | ~25 ms |
-| Concurrency × 10 (cached) | ~15 ms | ~40 ms |
-
-> Cache gives **~100× latency reduction** on repeated questions.
+| Variable | Description | Default |
+|---|---|---|
+| `LLM_API_KEY` | API key for the LLM provider | required |
+| `LLM_MODEL` | Model used for answers | your choice |
+| `EMBEDDING_MODEL` | Model used for embeddings | your choice |
+| `CHUNK_SIZE` | Tokens per chunk | 500 |
+| `CHUNK_OVERLAP` | Tokens shared between chunks | 50 |
+| `TOP_K` | Chunks retrieved per question | 4 |
+| `CACHE_TTL_SECONDS` | Answer cache lifetime | 3600 |
+| `DATABASE_URL` | PostgreSQL connection string | set in compose |
+| `REDIS_URL` | Redis connection string | set in compose |
 
 ---
 
-## Retrieval Evaluation
+## Design decisions
 
-Run `python scripts/eval_retrieval.py --qa-file scripts/eval_data.json`:
+| Decision | Choice | Why |
+|---|---|---|
+| Chunk size | 500 tokens, 50 overlap | Small enough for precise retrieval, large enough to keep context; overlap avoids cutting an answer in half. |
+| Vector index | FAISS | Fast local similarity search with no extra service to run. |
+| Metadata store | PostgreSQL | Chunk text, document status and query logs need relational queries and indexes. |
+| Caching | Redis, keyed by hash of question + document ids | Repeated questions skip embedding and the LLM call. |
+| Concurrency | `asyncio` for I/O, thread pool for PDF parsing | LLM, DB and cache calls are I/O-bound; PDF parsing blocks the event loop. |
 
-Fill `scripts/eval_data.json` with your Q&A pairs (see the sample file) then run the evaluator. It reports **Hits@3** — whether the correct chunk appears in the top-3 retrieved results.
+<!-- TODO: edit this table to match what you actually chose and why. -->
 
-```
-── Retrieval Evaluation ──────────────────
-  Questions : 20
-  Hits@3    : 18
-  Hit rate  : 90.0%
-──────────────────────────────────────────
-```
-
-*(Update with your real numbers after running against your documents.)*
-
----
-
-## SQL — Analytical Queries
+### Database schema
 
 ```sql
+documents(id, filename, status, num_chunks, uploaded_at)
+chunks(id, document_id, chunk_index, text, token_count)
+queries(id, question, answer, latency_ms, cache_hit, created_at)
+```
+
+Example analytics queries:
+
+```sql
+-- Cache hit rate
+SELECT AVG(cache_hit::int) AS hit_rate FROM queries;
+
 -- Average latency per day
-SELECT date_trunc('day', created_at) AS day,
-       round(avg(latency_ms)::numeric, 1) AS avg_ms,
-       count(*) AS requests
-FROM queries GROUP BY 1 ORDER BY 1 DESC;
-
--- Cache-hit rate
-SELECT round(100.0 * sum(cache_hit::int) / count(*), 2) AS hit_rate_pct
-FROM queries;
-
--- Top 10 most-asked questions
-SELECT question, count(*) AS cnt
-FROM queries GROUP BY question ORDER BY cnt DESC LIMIT 10;
+SELECT date_trunc('day', created_at) AS day, AVG(latency_ms) AS avg_ms
+FROM queries GROUP BY 1 ORDER BY 1;
 ```
 
 ---
 
-## Project Structure
+## Benchmarks
+
+Measured with `scripts/benchmark.py` on `<your machine>`, `<N>` requests:
+
+| Scenario | p50 latency | p95 latency |
+|---|---|---|
+| No cache | TODO ms | TODO ms |
+| With Redis cache | TODO ms | TODO ms |
+
+**Bottleneck found by profiling:** TODO (for example, embedding calls; fixed by batching).
+
+<!-- Fill this table only with numbers you actually measured. Delete the section if you haven't benchmarked yet. -->
+
+## Retrieval evaluation
+
+`scripts/eval_retrieval.py` runs a hand-labelled set of `<N>` questions on `<document>` and checks whether the correct chunk appears in the top 3 results.
+
+| Metric | Result |
+|---|---|
+| Hit rate @ 3 | TODO % |
+
+<!-- Delete this section if you haven't run an evaluation. -->
+
+---
+
+## Project structure
 
 ```
-askdocs/
+askdocs-rag/
   app/
-    main.py              # FastAPI app, routers, lifespan, middleware
-    api/
-      upload.py          # POST/DELETE /documents
-      docs_router.py     # GET /documents
-      ask.py             # POST /ask (RAG pipeline)
-      health.py          # GET /health
-    core/
-      config.py          # Pydantic settings from .env
-      logging.py         # Structured JSON logs + request-id
-      exceptions.py      # Custom exceptions with clear messages
+    main.py              # FastAPI app and startup
+    api/                 # documents.py, ask.py, health.py
+    core/                # config.py, logging.py
     services/
-      ingestion.py       # Text extraction + token chunking
-      embeddings.py      # Gemini embed_content, batching, caching
-      vector_store.py    # FAISS wrapper, persist/load, delete rebuild
-      llm.py             # Gemini GenerativeModel, cited-answer prompt
-      cache.py           # Redis + in-memory LRU fallback
-    db/
-      models.py          # SQLAlchemy ORM: Document, Chunk, Query
-      session.py         # Async engine + session factory
-      schema.sql         # Raw SQL schema + analytical queries
+      ingestion.py       # text extraction and chunking
+      embeddings.py      # batched embedding calls
+      vector_store.py    # FAISS wrapper
+      llm.py             # prompt building and LLM client
+      cache.py           # Redis with in-memory fallback
+    db/                  # models.py, session.py
   tests/
-    test_chunking.py     # Chunking edge cases
-    test_cache.py        # Cache hit/miss, TTL, invalidation
-    test_api.py          # FastAPI TestClient integration tests
-  scripts/
-    benchmark.py         # p50/p95 latency under concurrency
-    eval_retrieval.py    # Hits@k retrieval evaluation
-    eval_data.json       # Sample Q&A pairs (fill in your own)
-  Dockerfile
+  scripts/               # benchmark.py, eval_retrieval.py
   docker-compose.yml
-  .env.example
-  pyproject.toml         # ruff config, pytest config
-  .github/workflows/ci.yml
+  Dockerfile
+  README.md
 ```
 
 ---
 
-## Known Limitations & What's Next
-
-| Limitation | What I'd do next |
-|------------|-----------------|
-| FAISS `IndexFlatIP` does exact search — O(n) at query time | Migrate to `IndexIVFFlat` or `HNSW` above 500 k vectors |
-| Embedding calls are synchronous SDK wrapped in executor | Move to the async Gemini SDK when it reaches GA |
-| No re-ranking step | Add a cross-encoder re-ranker (e.g., `ms-marco-MiniLM`) for better precision |
-| Single FAISS process — not horizontally scalable | Replace with Qdrant or Weaviate for multi-node deployment |
-| No streaming responses | Add SSE streaming from `/ask` with `StreamingResponse` |
-| Ingestion failures are silent to the user | Add a webhook / polling endpoint that surfaces error details |
-
----
-
-## Running Tests
+## Testing
 
 ```bash
-pytest tests/ -v
+pip install -r requirements-dev.txt
+pytest
 ```
 
-LLM calls are mocked — tests run without a real API key.
+Tests cover chunking edge cases, retrieval of a known passage, API endpoints and cache hit/miss behavior. The LLM client is mocked.
 
 ---
 
-## Resume Entry
+## Limitations and next steps
 
-> **AskDocs: RAG Document Q&A Service** | Python, FastAPI, FAISS, PostgreSQL, Redis, Docker
-> - Built an async FastAPI service that ingests PDFs, chunks and embeds them, and answers questions via Gemini API with cited source passages.
-> - Added Redis caching (~100× latency reduction on cache hits), PostgreSQL query logging, and Docker Compose deployment.
-> - Wrote pytest suite covering chunking edge cases, cache hit/miss, and API validation; retrieval evaluation script reports Hits@3 on a hand-labelled question set.
-#   A s k D o c s  
- 
+- Only text-based PDFs are supported; scanned documents need OCR.
+- Retrieval uses vector similarity only; adding keyword search (BM25) or a re-ranker should help on exact-match queries.
+- FAISS runs in a single process; a managed vector database would be needed to scale to millions of chunks.
+- No authentication or per-user document isolation yet.
+
+<!-- Keep this list honest and specific. It shows you understand the system's limits. -->
+
+---
+
+## License
+
+MIT
