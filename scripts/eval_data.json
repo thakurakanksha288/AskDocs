@@ -1,0 +1,12 @@
+[
+  {
+    "question": "What is the main topic of this document?",
+    "expected_substring": "REPLACE_WITH_A_SUBSTRING_FROM_YOUR_DOCUMENT",
+    "document_id": "REPLACE_WITH_DOC_UUID"
+  },
+  {
+    "question": "What year was this published?",
+    "expected_substring": "REPLACE_WITH_YEAR",
+    "document_id": "REPLACE_WITH_DOC_UUID"
+  }
+]
